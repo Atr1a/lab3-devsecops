@@ -1,157 +1,318 @@
-# Практическая работа №3 — порядок выполнения на macOS
+# Практическая работа №3. Обеспечение безопасности данных и управление уязвимостями в контейнеризированной среде
 
-## Что лежит в папке
+**Дисциплина:** Методы и средства защиты облачной и сетевой инфраструктуры · **Дата:** 07.10.2026
 
-| Файл | Назначение |
-|---|---|
-| `Dockerfile`, `package.json`, `server.js` | Приложение **до исправления** (node:18, express 4.16.0, lodash 4.17.15) |
-| `deployment.yaml` | Небезопасный манифест (privileged: true) |
-| `secure/` | Исправленные версии: Dockerfile, package.json, server.js, deployment.yaml |
-| `security-scan.yml` | Пайплайн GitHub Actions (часть 5) — перед пушем переместить в `.github/workflows/` (см. шаг 5) |
-| `run_scans.sh` | Части 2–3 одной командой, результаты пишутся в `reports/` |
-| `.gitignore`, `.dockerignore` | Чтобы секреты и мусор не попали в git и в образ |
+## Результаты
 
----
+| Что проверялось | До исправления | После исправления |
+|---|---|---|
+| Уязвимости CRITICAL/HIGH в образе (Trivy) | **2 261** (227 CRITICAL, 2 034 HIGH) | **0** |
+| Нарушения в манифесте Kubernetes (Checkov) | **19** | **1** (`CKV_K8S_43`, обоснованно пропущено) |
+| Пайплайн GitHub Actions | ❌ сборка заблокирована | ✅ все проверки пройдены |
+| GitHub Code scanning | 5 000 открытых оповещений | 0 открытых, 5 000 закрытых |
 
-## Шаг 0. Установка (один раз)
+Главный вывод: **98,6 % уязвимостей приходилось на базовый образ `node:18`**, а не на код приложения. Наибольший эффект дали переход на `node:22-alpine` и удаление npm из рантайма. Обновление только express и lodash, как в методичке, устранило бы менее 0,5 % находок.
 
-```bash
-# Homebrew, если его нет (после установки выполните 2 команды, которые он выведет в конце)
-/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+## Содержание
 
-xcode-select --install
-brew install --cask docker
-brew install trivy checkov gnupg pinentry-mac gh
+- [Окружение](#окружение)
+- [Структура репозитория](#структура-репозитория)
+- [Часть 1. Тестовое приложение](#часть-1-тестовое-приложение)
+- [Часть 2. Сканирование образа с помощью Trivy](#часть-2-сканирование-образа-с-помощью-trivy)
+- [Часть 3. Статический анализ IaC с помощью Checkov](#часть-3-статический-анализ-iac-с-помощью-checkov)
+- [Часть 4. Управление ключами и шифрование с помощью GnuPG](#часть-4-управление-ключами-и-шифрование-с-помощью-gnupg)
+- [Часть 5. Интеграция в CI/CD (GitHub Actions)](#часть-5-интеграция-в-cicd-github-actions)
+- [Ответы на контрольные вопросы](#ответы-на-контрольные-вопросы)
+- [Выводы](#выводы)
 
-# Окно ввода пароля для GPG
-mkdir -m 700 -p ~/.gnupg
-echo "pinentry-program $(brew --prefix)/bin/pinentry-mac" >> ~/.gnupg/gpg-agent.conf
-gpgconf --kill gpg-agent
-echo 'export GPG_TTY=$(tty)' >> ~/.zshrc && source ~/.zshrc
+## Окружение
+
+Работа выполнена на **macOS 26.5.1 (Apple Silicon, arm64)** вместо Ubuntu из методички, инструменты установлены через Homebrew.
+
+| Инструмент | Версия | Назначение |
+|---|---|---|
+| Docker Desktop | 29.4.0 | Сборка контейнерных образов |
+| Trivy | 0.75.0 | Поиск CVE в образе |
+| Checkov | 3.3.20 | Статический анализ манифеста Kubernetes |
+| GnuPG (+ pinentry-mac) | 2.5.24 | Генерация ключей, шифрование, ротация |
+| git / GitHub CLI | 2.54.0 / 2.102.0 | Публикация репозитория, запуск GitHub Actions |
+
+## Структура репозитория
+
+```
+.
+├── .github/workflows/security-scan.yml   # CI: сборка + Trivy + Checkov + SARIF
+├── Dockerfile, package.json, server.js   # текущая (исправленная) версия, её собирает CI
+├── deployment.yaml                       # исправленный манифест Kubernetes
+├── vulnerable/                           # версия "до": node:18, старые зависимости, privileged: true
+├── secure/                               # версия "после" (копия корня)
+├── run_scans.sh                          # части 2–3 одной командой, вывод в reports/
+├── check_install.sh                      # проверка установленных инструментов
+├── screenshots/                          # скриншоты для отчёта
+└── INSTRUCTIONS_macOS.md                 # пошаговая инструкция по воспроизведению
 ```
 
-Запустите **Docker Desktop** из «Программ» и дождитесь, пока кит в строке меню перестанет мигать.
+Воспроизвести части 2–3: `bash run_scans.sh` (подробно — в [INSTRUCTIONS_macOS.md](INSTRUCTIONS_macOS.md)).
 
-Проверка (скриншот для отчёта):
-```bash
-docker --version && trivy --version && checkov --version && gpg --version | head -1
+## Часть 1. Тестовое приложение
+
+Минимальный HTTP-сервер на Express, отвечает «Hello, Security!» на порту 3000 ([`server.js`](server.js)).
+
+| | Уязвимая версия ([`vulnerable/`](vulnerable)) | Исправленная версия ([`secure/`](secure)) |
+|---|---|---|
+| Базовый образ | `node:18` (Debian 12.11, поддержка Node 18 прекращена) | `node:22-alpine` (Alpine 3.24.2) |
+| Зависимости | express 4.16.0, lodash 4.17.15 | express ^4.21.0, lodash ^4.17.21 |
+| Пакеты ОС | без обновления | `apk upgrade` при сборке |
+| npm / yarn / corepack в образе | есть | удалены после установки зависимостей |
+| Пользователь | root | `node` |
+
+<details>
+<summary>Исправленный Dockerfile</summary>
+
+```dockerfile
+FROM node:22-alpine
+WORKDIR /app
+
+RUN apk upgrade --no-cache || echo "WARNING: apk upgrade пропущен (зеркало Alpine недоступно)"
+
+COPY package*.json ./
+RUN npm install --omit=dev \
+ && npm cache clean --force \
+ && rm -rf /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/corepack \
+           /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack \
+           /usr/local/bin/yarn /usr/local/bin/yarnpkg /opt/yarn-*
+
+COPY server.js .
+USER node
+EXPOSE 3000
+CMD ["node", "server.js"]
 ```
+</details>
 
-Перейдите в папку проекта:
-```bash
-cd ~/Documents/Uni/Master2_1/Защита/Lab3
-```
-
----
-
-## Шаги 1–3. Trivy и Checkov
+## Часть 2. Сканирование образа с помощью Trivy
 
 ```bash
-bash run_scans.sh
-```
-
-Скрипт выполнит пункты 2.1–2.5 и 3.2–3.4 и сохранит каждый вывод в `reports/`. В конце он покажет итог «до/после». Первый запуск Trivy скачивает базу уязвимостей, это несколько минут.
-
-Ожидаемый результат Checkov: **до** — 20 нарушений, **после** — 1 (`CKV_K8S_43`, образ по digest; допустимо, так как образ не публикуется в реестр).
-
-Для отчёта сделайте скриншоты таблиц Trivy (Cmd+Shift+4) или возьмите текст из `reports/`.
-
-Если хотите выполнять команды по одной, как в методичке:
-```bash
-docker build -t demo-app:vulnerable .
+docker build -t demo-app:vulnerable vulnerable/
 trivy image demo-app:vulnerable
 trivy image --severity CRITICAL,HIGH demo-app:vulnerable
 trivy image --format json --output trivy-report.json demo-app:vulnerable
 docker build -t demo-app:secure secure/
 trivy image --severity CRITICAL,HIGH demo-app:secure
-checkov -f deployment.yaml --framework kubernetes
-checkov -f secure/deployment.yaml --framework kubernetes
 ```
 
----
+| Цель сканирования | До: всего (все уровни) | До: CRITICAL | До: HIGH | После: CRITICAL + HIGH |
+|---|---:|---:|---:|---:|
+| Пакеты ОС (Debian 12.11 → Alpine 3.24.2) | 10 665 | 226 | 2 003 | 0 |
+| npm: зависимости приложения (`/app/node_modules`) | — | 0 | 9 | 0 |
+| npm: библиотеки внутри самого npm | — | 1 | 22 | 0 (npm удалён) |
+| **Итого** | **10 723** | **227** | **2 034** | **0** |
 
-## Шаг 4. GnuPG (вручную — нужны скриншоты)
+**Анализ находок до исправления:**
+
+- **Базовый образ.** Полный `node:18` содержит 232 уязвимых пакета ОС и 6 981 уникальную CVE. Больше всего находок в `linux-libc-dev` (840 CRITICAL/HIGH), затем ImageMagick и Perl — инструменты сборки, которые приложению не нужны.
+- **Устаревание.** Для 1 746 из 2 229 находок CRITICAL/HIGH в ОС исправление уже выпущено: образ просто не обновлялся.
+- **Зависимости приложения (9 HIGH):**
+  - lodash 4.17.15: CVE-2021-23337 (внедрение команд через `template`), CVE-2020-8203 (prototype pollution);
+  - qs 6.5.1: CVE-2022-24999 (prototype poisoning);
+  - path-to-regexp 0.1.7: CVE-2024-45296 (ReDoS);
+  - body-parser 1.18.2: CVE-2024-45590 (DoS).
+
+  Уязвимые qs, path-to-regexp и body-parser подтянуты транзитивно через express 4.16.0.
+- **Библиотеки npm (23).** Единственная CRITICAL — `tar` 6.2.1 внутри npm (CVE-2026-59873). Ещё 8 HIGH в том же `tar` позволяют перезапись файлов через path traversal. npm нужен только при сборке, поэтому удалён из финального образа.
+
+После исправления Trivy пометил как «Clean» образ `demo-app:secure (alpine 3.24.2)` и каждый пакет в `app/node_modules`.
+
+## Часть 3. Статический анализ IaC с помощью Checkov
 
 ```bash
-# 4.1 Основной ключ: RSA and RSA, 4096, срок 1y, имя "Security Lab", email lab@example.com
-gpg --full-generate-key
-
-# 4.2 Просмотр ключей  → скриншот
-gpg --list-keys
-gpg --list-secret-keys
-
-# 4.3 Шифрование
-echo "DB_PASSWORD=SuperSecret123" > secrets.txt
-gpg --encrypt --recipient lab@example.com secrets.txt
-rm secrets.txt              # shred на macOS нет
-ls -l secrets.txt.gpg
-cat secrets.txt.gpg         # нечитаемые данные — скриншот
-
-# 4.4 Расшифровка
-gpg --decrypt secrets.txt.gpg > secrets_decrypted.txt
-cat secrets_decrypted.txt
-
-# 4.5 Ротация: второй ключ с email new-lab@example.com
-gpg --full-generate-key
-gpg --decrypt secrets.txt.gpg | gpg --encrypt --recipient new-lab@example.com -o secrets_new.gpg
-gpg --decrypt secrets_new.gpg
-gpg --list-keys             # видно оба ключа — скриншот
-
-# (дополнительно) сертификат отзыва старого ключа
-gpg --gen-revoke lab@example.com > revoke-old-key.asc
+checkov -f vulnerable/deployment.yaml --framework kubernetes   # до:    Passed 69, Failed 19
+checkov -f secure/deployment.yaml --framework kubernetes       # после: Passed 87, Failed 1
 ```
 
-В окне pinentry **не** ставьте галочку «Сохранить в связке ключей», иначе пароль не будет запрашиваться при расшифровке.
+Исправление из методички закрывает лишь часть проверок, поэтому манифест доработан. Неточность методички: `CKV_K8S_8` — проверка livenessProbe, а `readOnlyRootFilesystem` проверяет `CKV_K8S_22`.
 
-`secrets*.txt` и `*.gpg` занесены в `.gitignore` и в репозиторий не попадут.
+| Проверка | Что требует | Исправление | После |
+|---|---|---|---|
+| CKV_K8S_16 | Не запускать привилегированный контейнер | `privileged: false` | ✅ |
+| CKV_K8S_20 | Запрет повышения привилегий | `allowPrivilegeEscalation: false` | ✅ |
+| CKV_K8S_23 | Не запускать от root | `runAsNonRoot: true` | ✅ |
+| CKV_K8S_40 | Высокий UID | `runAsUser: 10001` | ✅ |
+| CKV_K8S_22 | ФС только для чтения | `readOnlyRootFilesystem: true` | ✅ |
+| CKV_K8S_37, CKV_K8S_28 | Сброс capabilities, в т.ч. NET_RAW | `capabilities: drop: ["ALL"]` | ✅ |
+| CKV_K8S_31 | Профиль seccomp | `seccompProfile: RuntimeDefault` | ✅ |
+| CKV_K8S_29 | securityContext пода | `spec.securityContext` | ✅ |
+| CKV_K8S_38 | Не монтировать токен ServiceAccount | `automountServiceAccountToken: false` | ✅ |
+| CKV_K8S_10, 11, 12, 13 | Запросы и лимиты CPU/памяти | requests 100m/128Mi, limits 500m/256Mi | ✅ |
+| CKV_K8S_8, CKV_K8S_9 | Liveness- и readiness-пробы | `httpGet /` на порт 3000 | ✅ |
+| CKV_K8S_15 | Всегда скачивать образ | `imagePullPolicy: Always` | ✅ |
+| CKV_K8S_21 | Не использовать namespace default | `namespace: demo` | ✅ |
+| CKV_K8S_43 | Образ по digest | Неприменимо: образ не публикуется в реестр | ⚠️ пропущена в CI |
 
----
+Дополнительно добавлена **NetworkPolicy**, разрешающая только входящий трафик на порт 3000. Её требует проверка `CKV2_K8S_6` в более новых версиях Checkov. Итоговый манифест — [`deployment.yaml`](deployment.yaml).
 
-## Шаг 5. GitHub Actions
+## Часть 4. Управление ключами и шифрование с помощью GnuPG
 
-```bash
-# 0) Переносим workflow на нужное место (один раз)
-mkdir -p .github/workflows && mv security-scan.yml .github/workflows/
+Файл с секретом зашифрован ключом RSA-4096, расшифрован без потерь и перешифрован новым ключом — так смоделирована ротация ключа в KMS.
 
-gh auth login                     # вход через браузер
+| Ключ | Пользователь | Алгоритм | Подключ шифрования | Срок действия |
+|---|---|---|---|---|
+| Исходный | Security Lab (randomcomment) &lt;lab@example.com&gt; | RSA 4096 | 0C3B2F97C8DB8719 | 1 год, до 07.10.2027 |
+| Новый (ротация) | Security Lab (new) &lt;new-lab@example.com&gt; | RSA 4096 | E135EB18D4B3BAD7 | 10 дней, до 17.10.2026 |
 
-# 1) Публикуем УЯЗВИМУЮ версию → пайплайн должен упасть
-git init -b main
-git add .
-git commit -m "Vulnerable version"
-gh repo create lab3-devsecops --public --source=. --push
-```
+**4.1. Генерация ключевой пары** (RSA and RSA, 4096 бит, срок 1 год, пароль через pinentry-mac):
 
-Откройте репозиторий → вкладка **Actions** → дождитесь красного статуса → скриншот (и скриншот лога шага Trivy с таблицей).
+![Генерация ключа](screenshots/gpg_01_generate_key.png)
 
-```bash
-# 2) Переносим исправленные файлы в корень → пайплайн должен пройти
-cp secure/Dockerfile secure/package.json secure/deployment.yaml .
-git add .
-git commit -m "Fix vulnerabilities: update base image, deps, harden manifest"
-git push
-```
+**4.2. Просмотр ключей.** Основной ключ имеет назначение [SC] (подпись и сертификация), подключ — [E] (шифрование):
 
-Дождитесь зелёного статуса → скриншот. Результаты Trivy также появятся во вкладке **Security → Code scanning**.
+![gpg --list-keys](screenshots/gpg_02_list_keys.png)
+![gpg --list-secret-keys](screenshots/gpg_03_list_secret_keys.png)
 
-Если пайплайн остался красным из-за Trivy — откройте лог шага, посмотрите, какой пакет даёт HIGH/CRITICAL, и обновите его версию (это и есть цикл «обнаружили → исправили → проверили»).
+**4.3. Шифрование.** Исходный `secrets.txt` удалён, `secrets.txt.gpg` (633 байта) без закрытого ключа нечитаем. На macOS нет `shred`, поэтому файл удалён командой `rm`:
 
----
+![Шифрование](screenshots/gpg_04_encrypt.png)
 
-## Что куда в отчёте
+**4.4. Расшифровка:**
 
-| Пункт отчёта | Откуда взять |
+![Расшифровка](screenshots/gpg_05_decrypt.png)
+
+**4.5. Ротация ключа.** Создан новый ключ, данные расшифрованы старым ключом и сразу зашифрованы новым через конвейер, без записи открытого текста на диск. `secrets_new.gpg` расшифровывается подключом нового ключа:
+
+![Генерация нового ключа](screenshots/gpg_06_generate_new_key.png)
+![Перешифрование и проверка](screenshots/gpg_07_rotation.png)
+
+> `secrets*.txt` и `*.gpg` исключены из репозитория через `.gitignore`. Значение `SuperSecret123` — учебное.
+
+## Часть 5. Интеграция в CI/CD (GitHub Actions)
+
+Workflow: [`.github/workflows/security-scan.yml`](.github/workflows/security-scan.yml). По сравнению с методичкой добавлены:
+
+- права `security-events: write` — без них не загрузится SARIF;
+- шаг установки Checkov — на раннере его нет;
+- `if: always()` для шагов после Trivy;
+- `ignore-unfixed: true`;
+- пропуск `CKV_K8S_43`.
+
+| Запуск | Коммит | Результат | Время | Упавшие шаги |
+|---|---|---|---|---|
+| #2 | Fix vulnerabilities: update base image, deps, harden manifest | ✅ успех | 1 мин 16 с | — |
+| #1 | Vulnerable version | ❌ провал | 1 мин 35 с | Trivy Image Scan, Checkov IaC Scan |
+
+**Запуск #1 — уязвимая версия, сборка заблокирована (security gate):**
+
+![Проваленный запуск](screenshots/ci_01_pipeline_failed.png)
+![Code scanning до](screenshots/ci_02_code_scanning_before.png)
+
+5 000 — это предел отображения результатов из одной загрузки SARIF, а не точное число находок. SARIF-отчёт trivy-action по умолчанию включает все уровни критичности; локально их было 10 723.
+
+**Запуск #2 — исправленная версия, все проверки пройдены, оповещения закрыты автоматически:**
+
+![Успешный запуск](screenshots/ci_03_pipeline_passed.png)
+![Code scanning после](screenshots/ci_04_code_scanning_after.png)
+
+## Ответы на контрольные вопросы
+
+<details>
+<summary><b>1. Чем отличается сканирование файловой системы (<code>trivy fs</code>) от сканирования образа (<code>trivy image</code>)?</b></summary>
+
+**`trivy fs`** анализирует каталог на диске:
+- исходный код и манифесты;
+- lock-файлы зависимостей (`package-lock.json`, `requirements.txt`);
+- секреты и ошибки конфигурации.
+
+Он запускается до сборки и даёт самую раннюю обратную связь.
+
+**`trivy image`** анализирует готовый артефакт по слоям: пакеты ОС базового образа и фактически установленные библиотеки.
+
+В этой работе 2 252 из 2 261 находки CRITICAL/HIGH (99,6 %) были в пакетах ОС и внутри npm. `trivy fs` по исходникам их бы не увидел.
+</details>
+
+<details>
+<summary><b>2. Почему Trivy и Checkov дополняют друг друга? В каких сценариях нужен каждый из них?</b></summary>
+
+Инструменты отвечают на разные вопросы:
+- **Trivy** — «что внутри артефакта»: известные CVE в пакетах и библиотеках.
+- **Checkov** — «как артефакт будет развёрнут»: ошибки конфигурации в Kubernetes, Terraform, CloudFormation, Dockerfile.
+
+Образ без единой CVE, запущенный с `privileged: true`, всё равно даёт атакующему выход на хост — и наоборот.
+
+**Когда нужен Trivy:**
+- при сборке;
+- перед публикацией образа в реестр;
+- для регулярного пересканирования развёрнутых образов: новые CVE появляются ежедневно.
+
+**Когда нужен Checkov:** при каждом изменении инфраструктурного кода, до `kubectl apply` или `terraform apply`.
+</details>
+
+<details>
+<summary><b>3. Какие принципы Zero Trust реализуются при использовании S3 Object Lock (или его аналогов)?</b></summary>
+
+Object Lock реализует модель WORM (write once, read many). В режиме Compliance объект нельзя удалить или перезаписать до истечения срока хранения никому, включая root-аккаунт.
+
+Принципы Zero Trust, которые это реализует:
+- **«Предполагай компрометацию».** Даже украденные административные учётные данные не позволят уничтожить данные.
+- **«Не доверять никому по умолчанию».** Права на удаление ограничены самим хранилищем, а не только политиками IAM.
+- **Целостность данных.**
+
+На практике это защита бэкапов и журналов аудита от шифровальщиков и заметания следов. Аналоги: Azure Immutable Blob Storage, GCS Bucket Lock.
+</details>
+
+<details>
+<summary><b>4. Как автоматическая ротация ключей KMS снижает риски компрометации?</b></summary>
+
+Ротация ограничивает ущерб от утечки ключа:
+- скомпрометированный ключ раскрывает только данные, зашифрованные в его период действия;
+- на одном ключе накапливается меньше шифротекста, который можно использовать для криптоанализа.
+
+**Почему автоматическая.** Ротация не зависит от того, что кто-то забудет или отложит смену ключа. Она проходит незаметно для приложений: KMS хранит старые версии ключа для расшифровки старых данных и шифрует новые данные новой версией. Это соответствует требованиям PCI DSS, ISO 27001 и NIST SP 800-57 к ограниченному сроку жизни ключа.
+
+В части 4 этот процесс выполнен вручную: расшифровка старым ключом и перешифрование новым.
+</details>
+
+<details>
+<summary><b>5. Почему шифрование данных без управления ключами не является полноценной защитой?</b></summary>
+
+Шифр защищает данные не лучше, чем защищён ключ. Злоумышленник, получивший доступ к данным, получит и ключ, если ключ:
+- хранится рядом с данными или в коде;
+- не имеет контроля доступа и аудита;
+- никогда не меняется и не может быть отозван.
+
+Полноценная защита охватывает весь жизненный цикл ключа:
+- безопасная генерация;
+- хранение отдельно от данных (KMS/HSM);
+- разграничение доступа;
+- журналирование использования;
+- ротация и отзыв;
+- резервное копирование.
+
+Потерять ключ без резервной копии — значит потерять данные.
+</details>
+
+## Выводы
+
+В работе реализован полный цикл DevSecOps «обнаружили → исправили → проверили» для образа, инфраструктурного кода и данных. Проверки встроены в CI/CD как security gate.
+
+**Освоенные методы:**
+- сканирование образов на CVE и приоритизация по критичности (Trivy): 2 261 → 0 находок CRITICAL/HIGH;
+- статический анализ манифестов Kubernetes и принцип наименьших привилегий (Checkov): 19 → 1 нарушение;
+- асимметричное шифрование и ротация ключей (GnuPG, RSA-4096) как модель облачного KMS;
+- автоматическая блокировка небезопасной сборки в GitHub Actions и публикация результатов в GitHub Code scanning (SARIF).
+
+**Трудности и решения:**
+
+| Трудность | Решение |
 |---|---|
-| 1. Описание приложения | `Dockerfile`, `package.json`, `server.js` (+ исправленные из `secure/`) |
-| 2. Trivy до/после | `reports/2.3_trivy_vulnerable_high.txt`, `reports/2.5_trivy_secure_high.txt` |
-| 3. Checkov до/после | `reports/3.2_checkov_before.txt`, `reports/3.4_checkov_after.txt` |
-| 4. GnuPG | скриншоты из шага 4 |
-| 5. CI/CD | скриншоты красного и зелёного запуска в Actions |
-| 6. Выводы | см. ниже |
+| Сбои сети при загрузке с ghcr.io (`HTTP2 framing layer`) при установке пакетов Homebrew | HTTP/1.1 для curl (`~/.curlrc`, `HOMEBREW_CURLRC=1`) |
+| Зеркало Alpine недоступно из Docker, сборка падала на `apk upgrade` | Шаг вынесен отдельно и сделан нефатальным; в CI выполняется полностью |
+| Команды методички рассчитаны на Ubuntu (`apt-key`, `shred`) | Установка через Homebrew; `rm` вместо `shred` |
+| В исходном workflow нет установки Checkov и права `security-events: write` | Добавлены шаг `pip install checkov` и блок `permissions` |
+| Исправление манифеста по методичке оставляет большинство нарушений | Добавлены лимиты, пробы, drop capabilities, seccomp, namespace, NetworkPolicy |
 
-**Идеи для выводов (трудности и улучшения):**
-- основной источник CVE — устаревший базовый образ `node:18`, а не код приложения; переход на `node:22-alpine` и удаление npm из рантайма дали наибольший эффект;
-- исправленный по методичке манифест закрывал лишь часть нарушений Checkov; потребовались лимиты ресурсов, пробы, drop capabilities, seccomp, NetworkPolicy;
-- в исходном workflow не было установки Checkov и прав `security-events: write`;
-- на macOS (APFS/SSD) нет `shred` — надёжное удаление файла не гарантируется, поэтому важно шифрование всего диска (FileVault);
-- улучшения: закреплять actions по SHA-коммиту, сканировать `trivy fs` ещё до сборки, автоматизировать обновление зависимостей (Dependabot).
+**Возможные улучшения:**
+- закрепить GitHub Actions по SHA-коммиту, а не по тегу — защита от компрометации цепочки поставки;
+- добавить `trivy fs` до сборки и зафиксировать зависимости через `package-lock.json` и `npm ci`;
+- публиковать образ в реестр и ссылаться на него по digest (закроет `CKV_K8S_43`), подписывать образ (cosign);
+- включить Dependabot и регулярное пересканирование по расписанию;
+- для данных на диске полагаться на шифрование всего носителя (FileVault): на SSD/APFS надёжное затирание отдельного файла не гарантируется.
+
+Учебный уязвимый образ не запускался, не публиковался в реестр и существовал только локально.

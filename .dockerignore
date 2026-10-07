@@ -1,11 +1,14 @@
-# Не тащим в образ лишнее и секретное (Dockerfile "до" делает COPY . .)
+# Не тащим в образ лишнее и секретное
 .git
 .github
 node_modules
 secure
+vulnerable
 reports
+screenshots
 secrets*.txt
 *.gpg
 trivy-report.json
 *.md
+*.sh
 .DS_Store

@@ -7,7 +7,7 @@ cd "$(dirname "$0")"
 mkdir -p reports
 
 echo "=== 2.1 Сборка уязвимого образа ==="
-docker build -t demo-app:vulnerable . || { echo "Ошибка сборки. Запущен ли Docker Desktop?"; exit 1; }
+docker build -t demo-app:vulnerable vulnerable/ || { echo "Ошибка сборки. Запущен ли Docker Desktop?"; exit 1; }
 
 echo "=== 2.2 Trivy: полный скан (до) ==="
 trivy image demo-app:vulnerable | tee reports/2.2_trivy_vulnerable_all.txt
@@ -24,7 +24,7 @@ docker build -t demo-app:secure secure/ || exit 1
 trivy image --severity CRITICAL,HIGH demo-app:secure | tee reports/2.5_trivy_secure_high.txt
 
 echo "=== 3.2 Checkov: небезопасный манифест (до) ==="
-checkov -f deployment.yaml --framework kubernetes --compact | tee reports/3.2_checkov_before.txt
+checkov -f vulnerable/deployment.yaml --framework kubernetes --compact | tee reports/3.2_checkov_before.txt
 
 echo "=== 3.4 Checkov: исправленный манифест (после) ==="
 checkov -f secure/deployment.yaml --framework kubernetes --compact | tee reports/3.4_checkov_after.txt
