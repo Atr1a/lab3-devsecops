@@ -2,7 +2,7 @@
   "name": "demo-app",
   "version": "1.0.0",
   "dependencies": {
-    "express": "4.16.0",
-    "lodash": "4.17.15"
+    "express": "^4.21.0",
+    "lodash": "^4.17.21"
   }
 }
