@@ -1,0 +1,47 @@
+name: Security Scan & Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# security-events: write нужен, чтобы загрузить SARIF-отчёт в GitHub Security
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t demo-app:${{ github.sha }} .
+
+      - name: Trivy Image Scan
+        uses: aquasecurity/trivy-action@0.35.0
+        with:
+          image-ref: demo-app:${{ github.sha }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+          ignore-unfixed: true   # не блокировать сборку из-за CVE, для которых ещё нет исправления
+          exit-code: '1'         # Security gate: блокировать сборку при критических уязвимостях
+
+      # Checkov не предустановлен на раннере GitHub — ставим его отдельным шагом
+      - name: Install Checkov
+        if: always()
+        run: pip install checkov
+
+      # CKV_K8S_43 (образ по digest) пропускаем: образ собирается локально и не публикуется в реестр
+      - name: Checkov IaC Scan
+        if: always()
+        run: checkov -f deployment.yaml --framework kubernetes --skip-check CKV_K8S_43
+
+      - name: Upload Trivy scan results
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'trivy-results.sarif'

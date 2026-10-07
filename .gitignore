@@ -1,0 +1,9 @@
+# Секреты и расшифрованные данные никогда не коммитим
+secrets.txt
+secrets_decrypted.txt
+*.gpg
+# Отчёты сканирования храним локально (для отчёта по работе)
+reports/
+trivy-report.json
+node_modules/
+.DS_Store

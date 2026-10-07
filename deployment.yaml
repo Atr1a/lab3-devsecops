@@ -1,0 +1,22 @@
+# deployment.yaml (намеренно небезопасный) — версия "до исправления"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo-app
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: demo
+  template:
+    metadata:
+      labels:
+        app: demo
+    spec:
+      containers:
+        - name: app
+          image: demo-app:secure
+          securityContext:
+            privileged: true
+          ports:
+            - containerPort: 3000
